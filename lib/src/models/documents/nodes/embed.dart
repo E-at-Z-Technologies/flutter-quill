@@ -21,7 +21,14 @@ class Embeddable {
     final m = Map<String, dynamic>.from(json);
     assert(m.length == 1, 'Embeddable map has one key');
 
-    return BlockEmbed(m.keys.first, m.values.first);
+    final type = m.keys.first;
+    final value = m.values.first;
+
+    if (value is String) {
+      return BlockEmbed(type, value);
+    } else {
+      return Embeddable(type, value);
+    }
   }
 }
 
