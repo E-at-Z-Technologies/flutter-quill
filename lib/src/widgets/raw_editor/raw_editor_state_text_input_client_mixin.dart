@@ -10,7 +10,6 @@ import '../editor.dart';
 
 mixin RawEditorStateTextInputClientMixin on EditorState
     implements TextInputClient {
-  final List<TextEditingValue> _sentRemoteValues = [];
   TextInputConnection? _textInputConnection;
   TextEditingValue? _lastKnownRemoteTextEditingValue;
 
@@ -77,7 +76,6 @@ mixin RawEditorStateTextInputClientMixin on EditorState
     _textInputConnection!.close();
     _textInputConnection = null;
     _lastKnownRemoteTextEditingValue = null;
-    _sentRemoteValues.clear();
   }
 
   /// Updates remote value based on current state of [document] and
@@ -105,17 +103,12 @@ mixin RawEditorStateTextInputClientMixin on EditorState
       return;
     }
 
-    final shouldRemember = value.text != _lastKnownRemoteTextEditingValue!.text;
     _lastKnownRemoteTextEditingValue = actualValue;
     _textInputConnection!.setEditingState(
       // Set composing to (-1, -1), otherwise an exception will be thrown if
       // the values are different.
       actualValue.copyWith(composing: const TextRange(start: -1, end: -1)),
     );
-    if (shouldRemember) {
-      // Only keep track if text changed (selection changes are not relevant)
-      _sentRemoteValues.add(actualValue);
-    }
   }
 
   @override
@@ -129,22 +122,6 @@ mixin RawEditorStateTextInputClientMixin on EditorState
   @override
   void updateEditingValue(TextEditingValue value) {
     if (!shouldCreateInputConnection) {
-      return;
-    }
-
-    if (_sentRemoteValues.contains(value)) {
-      /// There is a race condition in Flutter text input plugin where sending
-      /// updates to native side too often results in broken behavior.
-      /// TextInputConnection.setEditingValue is an async call to native side.
-      /// For each such call native side _always_ sends an update which triggers
-      /// this method (updateEditingValue) with the same value we've sent it.
-      /// If multiple calls to setEditingValue happen too fast and we only
-      /// track the last sent value then there is no way for us to filter out
-      /// automatic callbacks from native side.
-      /// Therefore we have to keep track of all values we send to the native
-      /// side and when we see this same value appear here we skip it.
-      /// This is fragile but it's probably the only available option.
-      _sentRemoteValues.remove(value);
       return;
     }
 
@@ -210,7 +187,7 @@ mixin RawEditorStateTextInputClientMixin on EditorState
   // origin, but the touch origin is used to determine which line the cursor is
   // on, we need this offset to correctly render and move the cursor.
   Offset _floatingCursorOffset(TextPosition textPosition) =>
-      Offset(0, getRenderEditor()!.preferredLineHeight(textPosition) / 2);
+      Offset(0, renderEditor.preferredLineHeight(textPosition) / 2);
 
   @override
   void updateFloatingCursor(RawFloatingCursorPoint point) {
@@ -225,14 +202,14 @@ mixin RawEditorStateTextInputClientMixin on EditorState
         _pointOffsetOrigin = point.offset;
 
         final currentTextPosition =
-            TextPosition(offset: getRenderEditor()!.selection.baseOffset);
+            TextPosition(offset: renderEditor.selection.baseOffset);
         _startCaretRect =
-            getRenderEditor()!.getLocalRectForCaret(currentTextPosition);
+            renderEditor.getLocalRectForCaret(currentTextPosition);
 
         _lastBoundedOffset = _startCaretRect!.center -
             _floatingCursorOffset(currentTextPosition);
         _lastTextPosition = currentTextPosition;
-        getRenderEditor()!.setFloatingCursor(
+        renderEditor.setFloatingCursor(
             point.state, _lastBoundedOffset!, _lastTextPosition!);
         break;
       case FloatingCursorDragState.Update:
@@ -243,24 +220,22 @@ mixin RawEditorStateTextInputClientMixin on EditorState
             _startCaretRect!.center + centeredPoint - floatingCursorOffset;
 
         final preferredLineHeight =
-            getRenderEditor()!.preferredLineHeight(_lastTextPosition!);
-        _lastBoundedOffset =
-            getRenderEditor()!.calculateBoundedFloatingCursorOffset(
+            renderEditor.preferredLineHeight(_lastTextPosition!);
+        _lastBoundedOffset = renderEditor.calculateBoundedFloatingCursorOffset(
           rawCursorOffset,
           preferredLineHeight,
         );
-        _lastTextPosition = getRenderEditor()!.getPositionForOffset(
-            getRenderEditor()!
-                .localToGlobal(_lastBoundedOffset! + floatingCursorOffset));
-        getRenderEditor()!.setFloatingCursor(
+        _lastTextPosition = renderEditor.getPositionForOffset(renderEditor
+            .localToGlobal(_lastBoundedOffset! + floatingCursorOffset));
+        renderEditor.setFloatingCursor(
             point.state, _lastBoundedOffset!, _lastTextPosition!);
         final newSelection = TextSelection.collapsed(
             offset: _lastTextPosition!.offset,
             affinity: _lastTextPosition!.affinity);
         // Setting selection as floating cursor moves will have scroll view
         // bring background cursor into view
-        getRenderEditor()!
-            .onSelectionChanged(newSelection, SelectionChangedCause.forcePress);
+        renderEditor.onSelectionChanged(
+            newSelection, SelectionChangedCause.forcePress);
         break;
       case FloatingCursorDragState.End:
         // We skip animation if no update has happened.
@@ -282,10 +257,10 @@ mixin RawEditorStateTextInputClientMixin on EditorState
   /// and current position of background cursor)
   void onFloatingCursorResetTick() {
     final finalPosition =
-        getRenderEditor()!.getLocalRectForCaret(_lastTextPosition!).centerLeft -
+        renderEditor.getLocalRectForCaret(_lastTextPosition!).centerLeft -
             _floatingCursorOffset(_lastTextPosition!);
     if (floatingCursorResetController.isCompleted) {
-      getRenderEditor()!.setFloatingCursor(
+      renderEditor.setFloatingCursor(
           FloatingCursorDragState.End, finalPosition, _lastTextPosition!);
       _startCaretRect = null;
       _lastTextPosition = null;
@@ -298,7 +273,7 @@ mixin RawEditorStateTextInputClientMixin on EditorState
       final lerpY =
           lerpDouble(_lastBoundedOffset!.dy, finalPosition.dy, lerpValue)!;
 
-      getRenderEditor()!.setFloatingCursor(FloatingCursorDragState.Update,
+      renderEditor.setFloatingCursor(FloatingCursorDragState.Update,
           Offset(lerpX, lerpY), _lastTextPosition!,
           resetLerpValue: lerpValue);
     }
@@ -317,6 +292,5 @@ mixin RawEditorStateTextInputClientMixin on EditorState
     _textInputConnection!.connectionClosedReceived();
     _textInputConnection = null;
     _lastKnownRemoteTextEditingValue = null;
-    _sentRemoteValues.clear();
   }
 }
