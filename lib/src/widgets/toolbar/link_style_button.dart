@@ -114,12 +114,17 @@ class _LinkStyleButtonState extends State<LinkStyleButton> {
           }
         }
 
-        text ??= widget.controller.document
-            .getPlainText(index, widget.controller.selection.end - index);
+        final len = widget.controller.selection.end - index;
+        text ??=
+            len == 0 ? '' : widget.controller.document.getPlainText(index, len);
         return _LinkDialog(
             dialogTheme: widget.dialogTheme, link: link, text: text);
       },
-    ).then(_linkSubmitted);
+    ).then(
+      (value) {
+        if (value != null) _linkSubmitted(value);
+      },
+    );
   }
 
   String? _getLinkAttributeValue() {
@@ -182,10 +187,11 @@ class _LinkDialogState extends State<_LinkDialog> {
     return AlertDialog(
       backgroundColor: widget.dialogTheme?.dialogBackgroundColor,
       content: Column(
+        mainAxisSize: MainAxisSize.min,
         children: [
+          const SizedBox(height: 8),
           TextField(
             keyboardType: TextInputType.multiline,
-            maxLines: null,
             style: widget.dialogTheme?.inputTextStyle,
             decoration: InputDecoration(
                 labelText: 'Text'.i18n,
@@ -195,9 +201,9 @@ class _LinkDialogState extends State<_LinkDialog> {
             onChanged: _textChanged,
             controller: _textController,
           ),
+          const SizedBox(height: 16),
           TextField(
             keyboardType: TextInputType.multiline,
-            maxLines: null,
             style: widget.dialogTheme?.inputTextStyle,
             decoration: InputDecoration(
                 labelText: 'Link'.i18n,
