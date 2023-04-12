@@ -1,4 +1,6 @@
 import 'dart:math' as math;
+// ignore: unnecessary_import
+import 'dart:typed_data';
 
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/foundation.dart';
@@ -7,18 +9,19 @@ import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:i18n_extension/i18n_widget.dart';
-import 'package:tuple/tuple.dart';
 
 import '../models/documents/document.dart';
 import '../models/documents/nodes/container.dart' as container_node;
+import '../models/documents/nodes/leaf.dart';
 import '../models/documents/style.dart';
+import '../models/structs/offset_value.dart';
 import '../utils/platform.dart';
 import 'box.dart';
 import 'controller.dart';
 import 'cursor.dart';
 import 'default_styles.dart';
 import 'delegate.dart';
-import 'embeds/default_embed_builder.dart';
+import 'embeds.dart';
 import 'float_cursor.dart';
 import 'link.dart';
 import 'raw_editor.dart';
@@ -34,7 +37,7 @@ abstract class EditorState extends State<RawEditor>
 
   EditorTextSelectionOverlay? get selectionOverlay;
 
-  List<Tuple2<int, Style>> get pasteStyle;
+  List<OffsetValue<Style>> get pasteStyle;
 
   String get pastePlainText;
 
@@ -153,6 +156,7 @@ class QuillEditor extends StatefulWidget {
       this.paintCursorAboveText,
       this.placeholder,
       this.enableInteractiveSelection = true,
+      this.enableSelectionToolbar = true,
       this.scrollBottomInset = 0,
       this.minHeight,
       this.maxHeight,
@@ -167,12 +171,18 @@ class QuillEditor extends StatefulWidget {
       this.onSingleLongTapStart,
       this.onSingleLongTapMoveUpdate,
       this.onSingleLongTapEnd,
-      this.embedBuilder = defaultEmbedBuilder,
+      this.embedBuilders,
+      this.unknownEmbedBuilder,
       this.linkActionPickerDelegate = defaultLinkActionPickerDelegate,
       this.customStyleBuilder,
       this.locale,
       this.floatingCursorDisabled = false,
       this.textSelectionControls,
+      this.onImagePaste,
+      this.customShortcuts,
+      this.customActions,
+      this.detectWordBoundary = true,
+      this.customLinkPrefixes = const <String>[],
       Key? key})
       : super(key: key);
 
@@ -180,6 +190,11 @@ class QuillEditor extends StatefulWidget {
     required QuillController controller,
     required bool readOnly,
     Brightness? keyboardAppearance,
+    Iterable<EmbedBuilder>? embedBuilders,
+
+    /// The locale to use for the editor toolbar, defaults to system locale
+    /// More at https://github.com/singerdmx/flutter-quill#translation
+    Locale? locale,
   }) {
     return QuillEditor(
       controller: controller,
@@ -191,6 +206,8 @@ class QuillEditor extends StatefulWidget {
       expands: false,
       padding: EdgeInsets.zero,
       keyboardAppearance: keyboardAppearance ?? Brightness.light,
+      locale: locale,
+      embedBuilders: embedBuilders,
     );
   }
 
@@ -254,7 +271,13 @@ class QuillEditor extends StatefulWidget {
   /// When this is false, the text selection cannot be adjusted by
   /// the user, text cannot be copied, and the user cannot paste into
   /// the text field from the clipboard.
+  ///
+  /// To disable just the selection toolbar, set enableSelectionToolbar
+  /// to false.
   final bool enableInteractiveSelection;
+
+  /// Whether to show the cut/copy/paste menu when selecting text.
+  final bool enableSelectionToolbar;
 
   /// The minimum height to be occupied by this editor.
   ///
@@ -339,7 +362,8 @@ class QuillEditor extends StatefulWidget {
           LongPressEndDetails details, TextPosition Function(Offset offset))?
       onSingleLongTapEnd;
 
-  final EmbedBuilder embedBuilder;
+  final Iterable<EmbedBuilder>? embedBuilders;
+  final EmbedBuilder? unknownEmbedBuilder;
   final CustomStyleBuilder? customStyleBuilder;
 
   /// The locale to use for the editor toolbar, defaults to system locale
@@ -368,6 +392,22 @@ class QuillEditor extends StatefulWidget {
   /// will be used
   final TextSelectionControls? textSelectionControls;
 
+  /// Callback when the user pastes the given image.
+  ///
+  /// Returns the url of the image if the image should be inserted.
+  final Future<String?> Function(Uint8List imageBytes)? onImagePaste;
+
+  final Map<LogicalKeySet, Intent>? customShortcuts;
+  final Map<Type, Action<Intent>>? customActions;
+
+  final bool detectWordBoundary;
+
+  /// Additional list if links prefixes, which must not be prepended
+  /// with "https://" when [LinkMenuAction.launch] happened
+  ///
+  /// Useful for deeplinks
+  final List<String> customLinkPrefixes;
+
   @override
   QuillEditorState createState() => QuillEditorState();
 }
@@ -382,7 +422,8 @@ class QuillEditorState extends State<QuillEditor>
   void initState() {
     super.initState();
     _selectionGestureDetectorBuilder =
-        _QuillEditorSelectionGestureDetectorBuilder(this);
+        _QuillEditorSelectionGestureDetectorBuilder(
+            this, widget.detectWordBoundary);
   }
 
   @override
@@ -418,6 +459,9 @@ class QuillEditorState extends State<QuillEditor>
           theme.colorScheme.primary.withOpacity(0.40);
     }
 
+    final showSelectionToolbar =
+        widget.enableInteractiveSelection && widget.enableSelectionToolbar;
+
     final child = RawEditor(
       key: _editorKey,
       controller: widget.controller,
@@ -429,12 +473,8 @@ class QuillEditorState extends State<QuillEditor>
       readOnly: widget.readOnly,
       placeholder: widget.placeholder,
       onLaunchUrl: widget.onLaunchUrl,
-      toolbarOptions: ToolbarOptions(
-        copy: widget.enableInteractiveSelection,
-        cut: widget.enableInteractiveSelection,
-        paste: widget.enableInteractiveSelection,
-        selectAll: widget.enableInteractiveSelection,
-      ),
+      contextMenuBuilder:
+          showSelectionToolbar ? RawEditor.defaultContextMenuBuilder : null,
       showSelectionHandles: isMobile(theme.platform),
       showCursor: widget.showCursor,
       cursorStyle: CursorStyle(
@@ -458,18 +498,26 @@ class QuillEditorState extends State<QuillEditor>
       keyboardAppearance: widget.keyboardAppearance,
       enableInteractiveSelection: widget.enableInteractiveSelection,
       scrollPhysics: widget.scrollPhysics,
-      embedBuilder: widget.embedBuilder,
+      embedBuilder: _getEmbedBuilder,
       linkActionPickerDelegate: widget.linkActionPickerDelegate,
       customStyleBuilder: widget.customStyleBuilder,
       floatingCursorDisabled: widget.floatingCursorDisabled,
+      onImagePaste: widget.onImagePaste,
+      customShortcuts: widget.customShortcuts,
+      customActions: widget.customActions,
+      customLinkPrefixes: widget.customLinkPrefixes,
     );
 
     final editor = I18n(
-        initialLocale: widget.locale,
-        child: _selectionGestureDetectorBuilder.build(
-          behavior: HitTestBehavior.translucent,
-          child: child,
-        ));
+      initialLocale: widget.locale,
+      child: selectionEnabled
+          ? _selectionGestureDetectorBuilder.build(
+              behavior: HitTestBehavior.translucent,
+              detectWordBoundary: widget.detectWordBoundary,
+              child: child,
+            )
+          : child,
+    );
 
     if (kIsWeb) {
       // Intercept RawKeyEvent on Web to prevent it from propagating to parents
@@ -488,6 +536,29 @@ class QuillEditorState extends State<QuillEditor>
     return editor;
   }
 
+  EmbedBuilder _getEmbedBuilder(Embed node) {
+    final builders = widget.embedBuilders;
+
+    if (builders != null) {
+      for (final builder in builders) {
+        if (builder.key == node.value.type) {
+          return builder;
+        }
+      }
+    }
+
+    if (widget.unknownEmbedBuilder != null) {
+      return widget.unknownEmbedBuilder!;
+    }
+
+    throw UnimplementedError(
+      'Embeddable type "${node.value.type}" is not supported by supplied '
+      'embed builders. You must pass your own builder function to '
+      'embedBuilders property of QuillEditor or QuillField widgets or '
+      'specify an unknownEmbedBuilder.',
+    );
+  }
+
   @override
   GlobalKey<EditorState> get editableTextKey => _editorKey;
 
@@ -504,10 +575,12 @@ class QuillEditorState extends State<QuillEditor>
 
 class _QuillEditorSelectionGestureDetectorBuilder
     extends EditorTextSelectionGestureDetectorBuilder {
-  _QuillEditorSelectionGestureDetectorBuilder(this._state)
-      : super(delegate: _state);
+  _QuillEditorSelectionGestureDetectorBuilder(
+      this._state, this._detectWordBoundary)
+      : super(delegate: _state, detectWordBoundary: _detectWordBoundary);
 
   final QuillEditorState _state;
+  final bool _detectWordBoundary;
 
   @override
   void onForcePressStart(ForcePressDetails details) {
@@ -555,11 +628,11 @@ class _QuillEditorSelectionGestureDetectorBuilder
     final pos = renderEditor!.getPositionForOffset(details.globalPosition);
     final result =
         editor!.widget.controller.document.querySegmentLeafNode(pos.offset);
-    final line = result.item1;
+    final line = result.line;
     if (line == null) {
       return false;
     }
-    final segmentLeaf = result.item2;
+    final segmentLeaf = result.leaf;
     if (segmentLeaf == null && line.length == 1) {
       editor!.widget.controller.updateSelection(
           TextSelection.collapsed(offset: pos.offset), ChangeSource.LOCAL);
@@ -600,7 +673,8 @@ class _QuillEditorSelectionGestureDetectorBuilder
     try {
       if (delegate.selectionEnabled && !_isPositionSelected(details)) {
         final _platform = Theme.of(_state.context).platform;
-        if (isAppleOS(_platform)) {
+        if (isAppleOS(_platform) || isDesktop()) {
+          // added isDesktop() to enable extend selection in Windows platform
           switch (details.kind) {
             case PointerDeviceKind.mouse:
             case PointerDeviceKind.stylus:
@@ -624,9 +698,15 @@ class _QuillEditorSelectionGestureDetectorBuilder
             case PointerDeviceKind.unknown:
               // On macOS/iOS/iPadOS a touch tap places the cursor at the edge
               // of the word.
-              renderEditor!
-                ..selectWordEdge(SelectionChangedCause.tap)
-                ..onSelectionCompleted();
+              if (_detectWordBoundary) {
+                renderEditor!
+                  ..selectWordEdge(SelectionChangedCause.tap)
+                  ..onSelectionCompleted();
+              } else {
+                renderEditor!
+                  ..selectPosition(cause: SelectionChangedCause.tap)
+                  ..onSelectionCompleted();
+              }
               break;
             case PointerDeviceKind.trackpad:
               // TODO: Handle this case.
@@ -1055,7 +1135,7 @@ class RenderEditor extends RenderEditableContainerBox
       start: localWord.start + nodeOffset,
       end: localWord.end + nodeOffset,
     );
-    if (position.offset - word.start <= 1) {
+    if (position.offset - word.start <= 1 && word.end != position.offset) {
       _handleSelectionChange(
         TextSelection.collapsed(offset: word.start),
         cause,
@@ -1571,8 +1651,7 @@ class RenderEditor extends RenderEditableContainerBox
   }
 }
 
-class QuillVerticalCaretMovementRun
-    extends BidirectionalIterator<TextPosition> {
+class QuillVerticalCaretMovementRun extends Iterator<TextPosition> {
   QuillVerticalCaretMovementRun._(
     this._editor,
     this._currentTextPosition,
@@ -1593,7 +1672,6 @@ class QuillVerticalCaretMovementRun
     return true;
   }
 
-  @override
   bool movePrevious() {
     _currentTextPosition = _editor.getTextPositionAbove(_currentTextPosition);
     return true;
@@ -1716,7 +1794,10 @@ class RenderEditableContainerBox extends RenderBox
       dy += child.size.height;
       child = childAfter(child);
     }
-    throw StateError('No child at offset $offset.');
+
+    // this case possible, when editor not scrollable,
+    // but minHeight > content height and tap was under content
+    return lastChild!;
   }
 
   @override

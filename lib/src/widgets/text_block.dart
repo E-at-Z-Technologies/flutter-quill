@@ -1,15 +1,21 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
-import 'package:tuple/tuple.dart';
 
-import '../../flutter_quill.dart';
+import '../models/documents/attribute.dart';
 import '../models/documents/nodes/block.dart';
 import '../models/documents/nodes/line.dart';
+import '../models/structs/vertical_spacing.dart';
 import '../utils/delta.dart';
 import 'box.dart';
+import 'controller.dart';
 import 'cursor.dart';
+import 'default_styles.dart';
 import 'delegate.dart';
+import 'editor.dart';
 import 'link.dart';
+import 'style_widgets/bullet_point.dart';
+import 'style_widgets/checkbox_point.dart';
+import 'style_widgets/number_point.dart';
 import 'text_line.dart';
 import 'text_selection.dart';
 
@@ -62,31 +68,35 @@ class EditableTextBlock extends StatelessWidget {
       required this.linkActionPicker,
       required this.cursorCont,
       required this.indentLevelCounts,
+      required this.clearIndents,
       required this.onCheckboxTap,
       required this.readOnly,
       this.onLaunchUrl,
       this.customStyleBuilder,
+      this.customLinkPrefixes = const <String>[],
       Key? key});
 
   final Block block;
   final QuillController controller;
   final TextDirection textDirection;
   final double scrollBottomInset;
-  final Tuple2 verticalSpacing;
+  final VerticalSpacing verticalSpacing;
   final TextSelection textSelection;
   final Color color;
   final DefaultStyles? styles;
   final bool enableInteractiveSelection;
   final bool hasFocus;
   final EdgeInsets? contentPadding;
-  final EmbedBuilder embedBuilder;
+  final EmbedsBuilder embedBuilder;
   final LinkActionPicker linkActionPicker;
   final ValueChanged<String>? onLaunchUrl;
   final CustomStyleBuilder? customStyleBuilder;
   final CursorCont cursorCont;
   final Map<int, int> indentLevelCounts;
+  final bool clearIndents;
   final Function(int, bool) onCheckboxTap;
   final bool readOnly;
+  final List<String> customLinkPrefixes;
 
   @override
   Widget build(BuildContext context) {
@@ -96,12 +106,12 @@ class EditableTextBlock extends StatelessWidget {
     return _EditableBlock(
         block: block,
         textDirection: textDirection,
-        padding: verticalSpacing as Tuple2<double, double>,
+        padding: verticalSpacing,
         scrollBottomInset: scrollBottomInset,
         decoration: _getDecorationForBlock(block, defaultStyles) ??
             const BoxDecoration(),
         contentPadding: contentPadding,
-        children: _buildChildren(context, indentLevelCounts));
+        children: _buildChildren(context, indentLevelCounts, clearIndents));
   }
 
   BoxDecoration? _getDecorationForBlock(
@@ -116,11 +126,14 @@ class EditableTextBlock extends StatelessWidget {
     return null;
   }
 
-  List<Widget> _buildChildren(
-      BuildContext context, Map<int, int> indentLevelCounts) {
+  List<Widget> _buildChildren(BuildContext context,
+      Map<int, int> indentLevelCounts, bool clearIndents) {
     final defaultStyles = QuillStyles.getStyles(context, false);
     final count = block.children.length;
     final children = <Widget>[];
+    if (clearIndents) {
+      indentLevelCounts.clear();
+    }
     var index = 0;
     for (final line in Iterable.castFrom<dynamic, Line>(block.children)) {
       index++;
@@ -137,6 +150,7 @@ class EditableTextBlock extends StatelessWidget {
             controller: controller,
             linkActionPicker: linkActionPicker,
             onLaunchUrl: onLaunchUrl,
+            customLinkPrefixes: customLinkPrefixes,
           ),
           _getIndentWidth(),
           _getSpacingForLine(line, index, count, defaultStyles),
@@ -237,7 +251,7 @@ class EditableTextBlock extends StatelessWidget {
     return baseIndent + extraIndent;
   }
 
-  Tuple2 _getSpacingForLine(
+  VerticalSpacing _getSpacingForLine(
       Line node, int index, int count, DefaultStyles? defaultStyles) {
     var top = 0.0, bottom = 0.0;
 
@@ -246,22 +260,22 @@ class EditableTextBlock extends StatelessWidget {
       final level = attrs[Attribute.header.key]!.value;
       switch (level) {
         case 1:
-          top = defaultStyles!.h1!.verticalSpacing.item1;
-          bottom = defaultStyles.h1!.verticalSpacing.item2;
+          top = defaultStyles!.h1!.verticalSpacing.top;
+          bottom = defaultStyles.h1!.verticalSpacing.bottom;
           break;
         case 2:
-          top = defaultStyles!.h2!.verticalSpacing.item1;
-          bottom = defaultStyles.h2!.verticalSpacing.item2;
+          top = defaultStyles!.h2!.verticalSpacing.top;
+          bottom = defaultStyles.h2!.verticalSpacing.bottom;
           break;
         case 3:
-          top = defaultStyles!.h3!.verticalSpacing.item1;
-          bottom = defaultStyles.h3!.verticalSpacing.item2;
+          top = defaultStyles!.h3!.verticalSpacing.top;
+          bottom = defaultStyles.h3!.verticalSpacing.bottom;
           break;
         default:
           throw 'Invalid level $level';
       }
     } else {
-      late Tuple2 lineSpacing;
+      late VerticalSpacing lineSpacing;
       if (attrs.containsKey(Attribute.blockQuote.key)) {
         lineSpacing = defaultStyles!.quote!.lineSpacing;
       } else if (attrs.containsKey(Attribute.indent.key)) {
@@ -276,8 +290,8 @@ class EditableTextBlock extends StatelessWidget {
         // use paragraph linespacing as a default
         lineSpacing = defaultStyles!.paragraph!.lineSpacing;
       }
-      top = lineSpacing.item1;
-      bottom = lineSpacing.item2;
+      top = lineSpacing.top;
+      bottom = lineSpacing.bottom;
     }
 
     if (index == 1) {
@@ -288,7 +302,7 @@ class EditableTextBlock extends StatelessWidget {
       bottom = 0.0;
     }
 
-    return Tuple2(top, bottom);
+    return VerticalSpacing(top, bottom);
   }
 }
 
@@ -595,13 +609,13 @@ class _EditableBlock extends MultiChildRenderObjectWidget {
 
   final Block block;
   final TextDirection textDirection;
-  final Tuple2<double, double> padding;
+  final VerticalSpacing padding;
   final double scrollBottomInset;
   final Decoration decoration;
   final EdgeInsets? contentPadding;
 
   EdgeInsets get _padding =>
-      EdgeInsets.only(top: padding.item1, bottom: padding.item2);
+      EdgeInsets.only(top: padding.top, bottom: padding.bottom);
 
   EdgeInsets get _contentPadding => contentPadding ?? EdgeInsets.zero;
 

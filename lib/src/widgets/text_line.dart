@@ -6,16 +6,17 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
-import 'package:tuple/tuple.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../models/documents/attribute.dart';
 import '../models/documents/nodes/container.dart' as container_node;
+import '../models/documents/nodes/embeddable.dart';
 import '../models/documents/nodes/leaf.dart';
 import '../models/documents/nodes/leaf.dart' as leaf;
 import '../models/documents/nodes/line.dart';
 import '../models/documents/nodes/node.dart';
 import '../models/documents/style.dart';
+import '../models/structs/vertical_spacing.dart';
 import '../utils/color.dart';
 import '../utils/font.dart';
 import '../utils/platform.dart';
@@ -40,18 +41,20 @@ class TextLine extends StatefulWidget {
     required this.linkActionPicker,
     this.textDirection,
     this.customStyleBuilder,
+    this.customLinkPrefixes = const <String>[],
     Key? key,
   }) : super(key: key);
 
   final Line line;
   final TextDirection? textDirection;
-  final EmbedBuilder embedBuilder;
+  final EmbedsBuilder embedBuilder;
   final DefaultStyles styles;
   final bool readOnly;
   final QuillController controller;
   final CustomStyleBuilder? customStyleBuilder;
   final ValueChanged<String>? onLaunchUrl;
   final LinkActionPicker linkActionPicker;
+  final List<String> customLinkPrefixes;
 
   @override
   State<TextLine> createState() => _TextLineState();
@@ -132,11 +135,28 @@ class _TextLineState extends State<TextLine> {
   @override
   Widget build(BuildContext context) {
     assert(debugCheckHasMediaQuery(context));
+
     if (widget.line.hasEmbed && widget.line.childCount == 1) {
-      // For video, it is always single child
-      final embed = widget.line.children.single as Embed;
-      return EmbedProxy(widget.embedBuilder(
-          context, widget.controller, embed, widget.readOnly));
+      // Single child embeds can be expanded
+      var embed = widget.line.children.single as Embed;
+      // Creates correct node for custom embed
+      if (embed.value.type == BlockEmbed.customType) {
+        embed = Embed(CustomBlockEmbed.fromJsonString(embed.value.data));
+      }
+      final embedBuilder = widget.embedBuilder(embed);
+      if (embedBuilder.expanded) {
+        // Creates correct node for custom embed
+
+        return EmbedProxy(
+          embedBuilder.build(
+            context,
+            widget.controller,
+            embed,
+            widget.readOnly,
+            false,
+          ),
+        );
+      }
     }
     final textSpan = _getTextSpanForWholeLine(context);
     final strutStyle = StrutStyle.fromTextStyle(textSpan.style!);
@@ -167,17 +187,28 @@ class _TextLineState extends State<TextLine> {
     // The line could contain more than one Embed & more than one Text
     final textSpanChildren = <InlineSpan>[];
     var textNodes = LinkedList<Node>();
-    for (final child in widget.line.children) {
+    for (var child in widget.line.children) {
       if (child is Embed) {
         if (textNodes.isNotEmpty) {
           textSpanChildren
               .add(_buildTextSpan(widget.styles, textNodes, lineStyle));
           textNodes = LinkedList<Node>();
         }
-        // Here it should be image
-        final embed = WidgetSpan(
-            child: EmbedProxy(widget.embedBuilder(
-                context, widget.controller, child, widget.readOnly)));
+        // Creates correct node for custom embed
+        if (child.value.type == BlockEmbed.customType) {
+          child = Embed(CustomBlockEmbed.fromJsonString(child.value.data));
+        }
+        final embedBuilder = widget.embedBuilder(child);
+        final embedWidget = EmbedProxy(
+          embedBuilder.build(
+            context,
+            widget.controller,
+            child,
+            widget.readOnly,
+            true,
+          ),
+        );
+        final embed = embedBuilder.buildWidgetSpan(embedWidget);
         textSpanChildren.add(embed);
         continue;
       }
@@ -401,7 +432,7 @@ class _TextLineState extends State<TextLine> {
     launchUrl ??= _launchUrl;
 
     link = link.trim();
-    if (!linkPrefixes
+    if (!(widget.customLinkPrefixes + linkPrefixes)
         .any((linkPrefix) => link!.toLowerCase().startsWith(linkPrefix))) {
       link = 'https://$link';
     }
@@ -463,7 +494,7 @@ class EditableTextLine extends RenderObjectWidget {
   final Widget? leading;
   final Widget body;
   final double indentWidth;
-  final Tuple2 verticalSpacing;
+  final VerticalSpacing verticalSpacing;
   final TextDirection textDirection;
   final TextSelection textSelection;
   final Color color;
@@ -513,8 +544,8 @@ class EditableTextLine extends RenderObjectWidget {
   EdgeInsetsGeometry _getPadding() {
     return EdgeInsetsDirectional.only(
         start: indentWidth,
-        top: verticalSpacing.item1,
-        bottom: verticalSpacing.item2);
+        top: verticalSpacing.top,
+        bottom: verticalSpacing.bottom);
   }
 }
 
@@ -1078,6 +1109,18 @@ class RenderEditableTextLine extends RenderEditableBox {
         _selectedRects ??= _body!.getBoxesForSelection(
           local,
         );
+
+        // Paint a small rect at the start of empty lines that
+        // are contained by the selection.
+        if (line.isEmpty &&
+            textSelection.baseOffset <= line.offset &&
+            textSelection.extentOffset > line.offset) {
+          final lineHeight =
+              preferredLineHeight(TextPosition(offset: line.offset));
+          _selectedRects
+              ?.add(TextBox.fromLTRBD(0, 0, 3, lineHeight, textDirection));
+        }
+
         _paintSelection(context, effectiveOffset);
       }
     }

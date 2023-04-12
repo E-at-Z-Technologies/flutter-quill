@@ -1,32 +1,38 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math' as math;
+// ignore: unnecessary_import
+import 'dart:typed_data';
+import 'dart:ui' as ui hide TextStyle;
 
-import 'package:flutter/cupertino.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_keyboard_visibility/flutter_keyboard_visibility.dart';
-import 'package:tuple/tuple.dart';
+import 'package:pasteboard/pasteboard.dart';
 
 import '../models/documents/attribute.dart';
 import '../models/documents/document.dart';
 import '../models/documents/nodes/block.dart';
 import '../models/documents/nodes/embeddable.dart';
+import '../models/documents/nodes/leaf.dart' as leaf;
 import '../models/documents/nodes/line.dart';
 import '../models/documents/nodes/node.dart';
 import '../models/documents/style.dart';
+import '../models/structs/offset_value.dart';
+import '../models/structs/vertical_spacing.dart';
+import '../utils/cast.dart';
 import '../utils/delta.dart';
+import '../utils/embeds.dart';
 import '../utils/platform.dart';
 import 'controller.dart';
 import 'cursor.dart';
 import 'default_styles.dart';
 import 'delegate.dart';
 import 'editor.dart';
-import 'embeds/default_embed_builder.dart';
-import 'embeds/image.dart';
 import 'keyboard_listener.dart';
 import 'link.dart';
 import 'proxy.dart';
@@ -36,6 +42,7 @@ import 'raw_editor/raw_editor_state_text_input_client_mixin.dart';
 import 'text_block.dart';
 import 'text_line.dart';
 import 'text_selection.dart';
+import 'toolbar/search_dialog.dart';
 
 class RawEditor extends StatefulWidget {
   const RawEditor(
@@ -46,18 +53,14 @@ class RawEditor extends StatefulWidget {
       required this.cursorStyle,
       required this.selectionColor,
       required this.selectionCtrls,
+      required this.embedBuilder,
       Key? key,
       this.scrollable = true,
       this.padding = EdgeInsets.zero,
       this.readOnly = false,
       this.placeholder,
       this.onLaunchUrl,
-      this.toolbarOptions = const ToolbarOptions(
-        copy: true,
-        cut: true,
-        paste: true,
-        selectAll: true,
-      ),
+      this.contextMenuBuilder = defaultContextMenuBuilder,
       this.showSelectionHandles = false,
       bool? showCursor,
       this.textCapitalization = TextCapitalization.none,
@@ -65,15 +68,18 @@ class RawEditor extends StatefulWidget {
       this.minHeight,
       this.maxContentWidth,
       this.customStyles,
+      this.customShortcuts,
+      this.customActions,
       this.expands = false,
       this.autoFocus = false,
       this.keyboardAppearance = Brightness.light,
       this.enableInteractiveSelection = true,
       this.scrollPhysics,
-      this.embedBuilder = defaultEmbedBuilder,
       this.linkActionPickerDelegate = defaultLinkActionPickerDelegate,
       this.customStyleBuilder,
-      this.floatingCursorDisabled = false})
+      this.floatingCursorDisabled = false,
+      this.onImagePaste,
+      this.customLinkPrefixes = const <String>[]})
       : assert(maxHeight == null || maxHeight > 0, 'maxHeight cannot be null'),
         assert(minHeight == null || minHeight >= 0, 'minHeight cannot be null'),
         assert(maxHeight == null || minHeight == null || maxHeight >= minHeight,
@@ -107,11 +113,26 @@ class RawEditor extends StatefulWidget {
   /// a link in the document.
   final ValueChanged<String>? onLaunchUrl;
 
-  /// Configuration of toolbar options.
+  /// Builds the text selection toolbar when requested by the user.
   ///
-  /// By default, all options are enabled. If [readOnly] is true,
-  /// paste and cut will be disabled regardless.
-  final ToolbarOptions toolbarOptions;
+  /// See also:
+  ///   * [EditableText.contextMenuBuilder], which builds the default
+  ///     text selection toolbar for [EditableText].
+  ///
+  /// If not provided, no context menu will be shown.
+  final QuillEditorContextMenuBuilder? contextMenuBuilder;
+
+  static Widget defaultContextMenuBuilder(
+    BuildContext context,
+    RawEditorState state,
+  ) {
+    return TextFieldTapRegion(
+      child: AdaptiveTextSelectionToolbar.buttonItems(
+        buttonItems: state.contextMenuButtonItems,
+        anchors: state.contextMenuAnchors,
+      ),
+    );
+  }
 
   /// Whether to show selection handles.
   ///
@@ -220,11 +241,17 @@ class RawEditor extends StatefulWidget {
   /// See [Scrollable.physics].
   final ScrollPhysics? scrollPhysics;
 
+  final Future<String?> Function(Uint8List imageBytes)? onImagePaste;
+
+  final Map<LogicalKeySet, Intent>? customShortcuts;
+  final Map<Type, Action<Intent>>? customActions;
+
   /// Builder function for embeddable objects.
-  final EmbedBuilder embedBuilder;
+  final EmbedsBuilder embedBuilder;
   final LinkActionPickerDelegate linkActionPickerDelegate;
   final CustomStyleBuilder? customStyleBuilder;
   final bool floatingCursorDisabled;
+  final List<String> customLinkPrefixes;
 
   @override
   State<StatefulWidget> createState() => RawEditorState();
@@ -259,6 +286,7 @@ class RawEditorState extends EditorState
 
   // Focus
   bool _didAutoFocus = false;
+
   bool get _hasFocus => widget.focusNode.hasFocus;
 
   // Theme
@@ -266,8 +294,9 @@ class RawEditorState extends EditorState
 
   // for pasting style
   @override
-  List<Tuple2<int, Style>> get pasteStyle => _pasteStyle;
-  List<Tuple2<int, Style>> _pasteStyle = <Tuple2<int, Style>>[];
+  List<OffsetValue<Style>> get pasteStyle => _pasteStyle;
+  List<OffsetValue<Style>> _pasteStyle = <OffsetValue<Style>>[];
+
   @override
   String get pastePlainText => _pastePlainText;
   String _pastePlainText = '';
@@ -279,15 +308,118 @@ class RawEditorState extends EditorState
 
   TextDirection get _textDirection => Directionality.of(context);
 
+  /// Returns the [ContextMenuButtonItem]s representing the buttons in this
+  /// platform's default selection menu for [RawEditor].
+  ///
+  /// Copied from [EditableTextState].
+  List<ContextMenuButtonItem> get contextMenuButtonItems {
+    return EditableText.getEditableButtonItems(
+      clipboardStatus: _clipboardStatus.value,
+      onCopy: copyEnabled
+          ? () => copySelection(SelectionChangedCause.toolbar)
+          : null,
+      onCut:
+          cutEnabled ? () => cutSelection(SelectionChangedCause.toolbar) : null,
+      onPaste:
+          pasteEnabled ? () => pasteText(SelectionChangedCause.toolbar) : null,
+      onSelectAll: selectAllEnabled
+          ? () => selectAll(SelectionChangedCause.toolbar)
+          : null,
+    );
+  }
+
+  /// Returns the anchor points for the default context menu.
+  ///
+  /// Copied from [EditableTextState].
+  TextSelectionToolbarAnchors get contextMenuAnchors {
+    final glyphHeights = _getGlyphHeights();
+    final selection = textEditingValue.selection;
+    final points = renderEditor.getEndpointsForSelection(selection);
+    return TextSelectionToolbarAnchors.fromSelection(
+      renderBox: renderEditor,
+      startGlyphHeight: glyphHeights.startGlyphHeight,
+      endGlyphHeight: glyphHeights.endGlyphHeight,
+      selectionEndpoints: points,
+    );
+  }
+
+  /// Gets the line heights at the start and end of the selection for the given
+  /// [RawEditorState].
+  ///
+  /// Copied from [EditableTextState].
+  _GlyphHeights _getGlyphHeights() {
+    final selection = textEditingValue.selection;
+
+    // Only calculate handle rects if the text in the previous frame
+    // is the same as the text in the current frame. This is done because
+    // widget.renderObject contains the renderEditable from the previous frame.
+    // If the text changed between the current and previous frames then
+    // widget.renderObject.getRectForComposingRange might fail. In cases where
+    // the current frame is different from the previous we fall back to
+    // renderObject.preferredLineHeight.
+    final prevText = renderEditor.document.toPlainText();
+    final currText = textEditingValue.text;
+    if (prevText != currText || !selection.isValid || selection.isCollapsed) {
+      return _GlyphHeights(
+        renderEditor.preferredLineHeight(selection.base),
+        renderEditor.preferredLineHeight(selection.base),
+      );
+    }
+
+    final startCharacterRect =
+        renderEditor.getLocalRectForCaret(selection.base);
+    final endCharacterRect =
+        renderEditor.getLocalRectForCaret(selection.extent);
+    return _GlyphHeights(
+      startCharacterRect.height,
+      endCharacterRect.height,
+    );
+  }
+
+  void _defaultOnTapOutside(PointerDownEvent event) {
+    /// The focus dropping behavior is only present on desktop platforms
+    /// and mobile browsers.
+    switch (defaultTargetPlatform) {
+      case TargetPlatform.android:
+      case TargetPlatform.iOS:
+      case TargetPlatform.fuchsia:
+        // On mobile platforms, we don't unfocus on touch events unless they're
+        // in the web browser, but we do unfocus for all other kinds of events.
+        switch (event.kind) {
+          case ui.PointerDeviceKind.touch:
+            if (kIsWeb) {
+              widget.focusNode.unfocus();
+            }
+            break;
+          case ui.PointerDeviceKind.mouse:
+          case ui.PointerDeviceKind.stylus:
+          case ui.PointerDeviceKind.invertedStylus:
+          case ui.PointerDeviceKind.unknown:
+            widget.focusNode.unfocus();
+            break;
+          case ui.PointerDeviceKind.trackpad:
+            throw UnimplementedError(
+                'Unexpected pointer down event for trackpad');
+        }
+        break;
+      case TargetPlatform.linux:
+      case TargetPlatform.macOS:
+      case TargetPlatform.windows:
+        widget.focusNode.unfocus();
+        break;
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     assert(debugCheckHasMediaQuery(context));
     super.build(context);
 
-    var _doc = widget.controller.document;
+    var _doc = controller.document;
     if (_doc.isEmpty() && widget.placeholder != null) {
+      final raw = widget.placeholder?.replaceAll(r'"', '\\"');
       _doc = Document.fromJson(jsonDecode(
-          '[{"attributes":{"placeholder":true},"insert":"${widget.placeholder}\\n"}]'));
+          '[{"attributes":{"placeholder":true},"insert":"$raw\\n"}]'));
     }
 
     Widget child = CompositedTransformTarget(
@@ -296,7 +428,7 @@ class RawEditorState extends EditorState
         child: _Editor(
           key: _editorKey,
           document: _doc,
-          selection: widget.controller.selection,
+          selection: controller.selection,
           hasFocus: _hasFocus,
           scrollable: widget.scrollable,
           cursorController: _cursorCont,
@@ -322,7 +454,7 @@ class RawEditorState extends EditorState
       /// baseline.
       // This implies that the first line has no styles applied to it.
       final baselinePadding =
-          EdgeInsets.only(top: _styles!.paragraph!.verticalSpacing.item1);
+          EdgeInsets.only(top: _styles!.paragraph!.verticalSpacing.top);
       child = BaselineProxy(
         textStyle: _styles!.paragraph!.style,
         padding: baselinePadding,
@@ -335,7 +467,7 @@ class RawEditorState extends EditorState
               key: _editorKey,
               offset: offset,
               document: _doc,
-              selection: widget.controller.selection,
+              selection: controller.selection,
               hasFocus: _hasFocus,
               scrollable: widget.scrollable,
               textDirection: _textDirection,
@@ -361,16 +493,86 @@ class RawEditorState extends EditorState
             minHeight: widget.minHeight ?? 0.0,
             maxHeight: widget.maxHeight ?? double.infinity);
 
-    return QuillStyles(
-      data: _styles!,
-      child: Actions(
-        actions: _actions,
-        child: Focus(
-          focusNode: widget.focusNode,
-          child: QuillKeyboardListener(
-            child: Container(
-              constraints: constraints,
-              child: child,
+    return TextFieldTapRegion(
+      onTapOutside: _defaultOnTapOutside,
+      child: QuillStyles(
+        data: _styles!,
+        child: Shortcuts(
+          shortcuts: <LogicalKeySet, Intent>{
+            // shortcuts added for Desktop platforms.
+            LogicalKeySet(LogicalKeyboardKey.escape):
+                const HideSelectionToolbarIntent(),
+            LogicalKeySet(LogicalKeyboardKey.control, LogicalKeyboardKey.keyZ):
+                const UndoTextIntent(SelectionChangedCause.keyboard),
+            LogicalKeySet(LogicalKeyboardKey.control, LogicalKeyboardKey.keyY):
+                const RedoTextIntent(SelectionChangedCause.keyboard),
+
+            // Selection formatting.
+            LogicalKeySet(LogicalKeyboardKey.control, LogicalKeyboardKey.keyB):
+                const ToggleTextStyleIntent(Attribute.bold),
+            LogicalKeySet(LogicalKeyboardKey.control, LogicalKeyboardKey.keyU):
+                const ToggleTextStyleIntent(Attribute.underline),
+            LogicalKeySet(LogicalKeyboardKey.control, LogicalKeyboardKey.keyI):
+                const ToggleTextStyleIntent(Attribute.italic),
+            LogicalKeySet(LogicalKeyboardKey.control, LogicalKeyboardKey.shift,
+                    LogicalKeyboardKey.keyS):
+                const ToggleTextStyleIntent(Attribute.strikeThrough),
+            LogicalKeySet(
+                    LogicalKeyboardKey.control, LogicalKeyboardKey.backquote):
+                const ToggleTextStyleIntent(Attribute.inlineCode),
+            LogicalKeySet(LogicalKeyboardKey.control, LogicalKeyboardKey.keyL):
+                const ToggleTextStyleIntent(Attribute.ul),
+            LogicalKeySet(LogicalKeyboardKey.control, LogicalKeyboardKey.keyO):
+                const ToggleTextStyleIntent(Attribute.ol),
+            LogicalKeySet(LogicalKeyboardKey.control, LogicalKeyboardKey.shift,
+                    LogicalKeyboardKey.keyB):
+                const ToggleTextStyleIntent(Attribute.blockQuote),
+            LogicalKeySet(LogicalKeyboardKey.control, LogicalKeyboardKey.shift,
+                    LogicalKeyboardKey.tilde):
+                const ToggleTextStyleIntent(Attribute.codeBlock),
+            // Indent
+            LogicalKeySet(LogicalKeyboardKey.control,
+                    LogicalKeyboardKey.bracketRight):
+                const IndentSelectionIntent(true),
+            LogicalKeySet(
+                    LogicalKeyboardKey.control, LogicalKeyboardKey.bracketLeft):
+                const IndentSelectionIntent(false),
+
+            LogicalKeySet(LogicalKeyboardKey.control, LogicalKeyboardKey.keyF):
+                const OpenSearchIntent(),
+
+            LogicalKeySet(
+                    LogicalKeyboardKey.control, LogicalKeyboardKey.digit1):
+                const ApplyHeaderIntent(Attribute.h1),
+            LogicalKeySet(
+                    LogicalKeyboardKey.control, LogicalKeyboardKey.digit2):
+                const ApplyHeaderIntent(Attribute.h2),
+            LogicalKeySet(
+                    LogicalKeyboardKey.control, LogicalKeyboardKey.digit3):
+                const ApplyHeaderIntent(Attribute.h3),
+            LogicalKeySet(
+                    LogicalKeyboardKey.control, LogicalKeyboardKey.digit0):
+                const ApplyHeaderIntent(Attribute.header),
+
+            LogicalKeySet(LogicalKeyboardKey.control, LogicalKeyboardKey.shift,
+                LogicalKeyboardKey.keyL): const ApplyCheckListIntent(),
+
+            if (widget.customShortcuts != null) ...widget.customShortcuts!,
+          },
+          child: Actions(
+            actions: {
+              ..._actions,
+              if (widget.customActions != null) ...widget.customActions!,
+            },
+            child: Focus(
+              focusNode: widget.focusNode,
+              onKey: _onKey,
+              child: QuillKeyboardListener(
+                child: Container(
+                  constraints: constraints,
+                  child: child,
+                ),
+              ),
             ),
           ),
         ),
@@ -378,10 +580,134 @@ class RawEditorState extends EditorState
     );
   }
 
+  KeyEventResult _onKey(node, RawKeyEvent event) {
+    // Don't handle key if there is a meta key pressed.
+    if (event.isAltPressed || event.isControlPressed || event.isMetaPressed) {
+      return KeyEventResult.ignored;
+    }
+
+    if (event is! RawKeyDownEvent) {
+      return KeyEventResult.ignored;
+    }
+
+    // Don't handle key if there is an active selection.
+    if (controller.selection.baseOffset != controller.selection.extentOffset) {
+      return KeyEventResult.ignored;
+    }
+
+    // Handle indenting blocks when pressing the tab key.
+    if (event.logicalKey == LogicalKeyboardKey.tab) {
+      return _handleTabKey(event);
+    }
+
+    // Handle inserting lists when space is pressed following
+    // a list initiating phrase.
+    if (event.logicalKey == LogicalKeyboardKey.space) {
+      return _handleSpaceKey(event);
+    }
+
+    return KeyEventResult.ignored;
+  }
+
+  KeyEventResult _handleSpaceKey(RawKeyEvent event) {
+    final child =
+        controller.document.queryChild(controller.selection.baseOffset);
+    if (child.node == null) {
+      return KeyEventResult.ignored;
+    }
+
+    final line = child.node as Line?;
+    if (line == null) {
+      return KeyEventResult.ignored;
+    }
+
+    final text = castOrNull<leaf.Text>(line.first);
+    if (text == null) {
+      return KeyEventResult.ignored;
+    }
+
+    const olKeyPhrase = '1.';
+    const ulKeyPhrase = '-';
+
+    if (text.value == olKeyPhrase) {
+      _updateSelectionForKeyPhrase(olKeyPhrase, Attribute.ol);
+    } else if (text.value == ulKeyPhrase) {
+      _updateSelectionForKeyPhrase(ulKeyPhrase, Attribute.ul);
+    } else {
+      return KeyEventResult.ignored;
+    }
+
+    return KeyEventResult.handled;
+  }
+
+  KeyEventResult _handleTabKey(RawKeyEvent event) {
+    final child =
+        controller.document.queryChild(controller.selection.baseOffset);
+
+    KeyEventResult insertTabCharacter() {
+      controller.replaceText(controller.selection.baseOffset, 0, '\t', null);
+      _moveCursor(1);
+      return KeyEventResult.handled;
+    }
+
+    if (child.node == null) {
+      return insertTabCharacter();
+    }
+
+    final node = child.node!;
+
+    final parent = node.parent;
+    if (parent == null || parent is! Block) {
+      return insertTabCharacter();
+    }
+
+    if (node is! Line || (node.isNotEmpty && node.first is! leaf.Text)) {
+      return insertTabCharacter();
+    }
+
+    final parentBlock = parent;
+    if (parentBlock.style.containsKey(Attribute.ol.key) ||
+        parentBlock.style.containsKey(Attribute.ul.key) ||
+        parentBlock.style.containsKey(Attribute.checked.key)) {
+      if (node.isNotEmpty &&
+          (node.first as leaf.Text).value.isNotEmpty &&
+          controller.selection.base.offset > node.documentOffset) {
+        return insertTabCharacter();
+      }
+      controller.indentSelection(!event.isShiftPressed);
+      return KeyEventResult.handled;
+    }
+
+    if (node.isNotEmpty && (node.first as leaf.Text).value.isNotEmpty) {
+      return insertTabCharacter();
+    }
+
+    return insertTabCharacter();
+  }
+
+  void _moveCursor(int chars) {
+    final selection = controller.selection;
+    controller.updateSelection(
+        controller.selection.copyWith(
+            baseOffset: selection.baseOffset + chars,
+            extentOffset: selection.baseOffset + chars),
+        ChangeSource.LOCAL);
+  }
+
+  void _updateSelectionForKeyPhrase(String phrase, Attribute attribute) {
+    controller.replaceText(controller.selection.baseOffset - phrase.length,
+        phrase.length, '\n', null);
+    _moveCursor(-phrase.length);
+    controller
+      ..formatSelection(attribute)
+      // Remove the added newline.
+      ..replaceText(controller.selection.baseOffset + 1, 1, '', null);
+  }
+
   void _handleSelectionChanged(
       TextSelection selection, SelectionChangedCause cause) {
-    final oldSelection = widget.controller.selection;
-    widget.controller.updateSelection(selection, ChangeSource.LOCAL);
+    final oldSelection = controller.selection;
+    controller.updateSelection(selection, ChangeSource.LOCAL);
 
     _selectionOverlay?.handlesVisible = _shouldShowSelectionHandles();
 
@@ -403,7 +729,7 @@ class RawEditorState extends EditorState
   }
 
   void _handleSelectionCompleted() {
-    widget.controller.onSelectionCompleted?.call();
+    controller.onSelectionCompleted?.call();
   }
 
   /// Updates the checkbox positioned at [offset] in document
@@ -411,23 +737,25 @@ class RawEditorState extends EditorState
   void _handleCheckboxTap(int offset, bool value) {
     if (!widget.readOnly) {
       _disableScrollControllerAnimateOnce = true;
-      widget.controller.ignoreFocusOnTextChange = true;
-      final currentSelection = widget.controller.selection.copyWith();
+      final currentSelection = controller.selection.copyWith();
       final attribute = value ? Attribute.checked : Attribute.unchecked;
 
-      widget.controller.formatText(offset, 0, attribute);
+      controller
+        ..ignoreFocusOnTextChange = true
+        ..formatText(offset, 0, attribute)
 
-      // Checkbox tapping causes controller.selection to go to offset 0
-      // Stop toggling those two toolbar buttons
-      widget.controller.toolbarButtonToggler = {
-        Attribute.list.key: attribute,
-        Attribute.header.key: Attribute.header
-      };
+        // Checkbox tapping causes controller.selection to go to offset 0
+        // Stop toggling those two toolbar buttons
+        ..toolbarButtonToggler = {
+          Attribute.list.key: attribute,
+          Attribute.header.key: Attribute.header
+        };
 
       // Go back from offset 0 to current selection
       SchedulerBinding.instance.addPostFrameCallback((_) {
-        widget.controller.ignoreFocusOnTextChange = false;
-        widget.controller.updateSelection(currentSelection, ChangeSource.LOCAL);
+        controller
+          ..ignoreFocusOnTextChange = false
+          ..updateSelection(currentSelection, ChangeSource.LOCAL);
       });
     }
   }
@@ -435,20 +763,35 @@ class RawEditorState extends EditorState
   List<Widget> _buildChildren(Document doc, BuildContext context) {
     final result = <Widget>[];
     final indentLevelCounts = <int, int>{};
+    // this need for several ordered list in document
+    // we need to reset indents Map, if list finished
+    // List finished when there is node without Attribute.ol in styles
+    // So in this case we set clearIndents=true and send it
+    // to the next EditableTextBlock
+    var prevNodeOl = false;
+    var clearIndents = false;
+
     for (final node in doc.root.children) {
+      final attrs = node.style.attributes;
+
+      if (prevNodeOl && attrs[Attribute.list.key] != Attribute.ol) {
+        clearIndents = true;
+      }
+
+      prevNodeOl = attrs[Attribute.list.key] == Attribute.ol;
+
       if (node is Line) {
         final editableTextLine = _getEditableTextLineFromNode(node, context);
         result.add(Directionality(
             textDirection: getDirectionOfNode(node), child: editableTextLine));
       } else if (node is Block) {
-        final attrs = node.style.attributes;
         final editableTextBlock = EditableTextBlock(
             block: node,
-            controller: widget.controller,
+            controller: controller,
             textDirection: _textDirection,
             scrollBottomInset: widget.scrollBottomInset,
             verticalSpacing: _getVerticalSpacingForBlock(node, _styles),
-            textSelection: widget.controller.selection,
+            textSelection: controller.selection,
             color: widget.selectionColor,
             styles: _styles,
             enableInteractiveSelection: widget.enableInteractiveSelection,
@@ -461,11 +804,15 @@ class RawEditorState extends EditorState
             onLaunchUrl: widget.onLaunchUrl,
             cursorCont: _cursorCont,
             indentLevelCounts: indentLevelCounts,
+            clearIndents: clearIndents,
             onCheckboxTap: _handleCheckboxTap,
             readOnly: widget.readOnly,
-            customStyleBuilder: widget.customStyleBuilder);
+            customStyleBuilder: widget.customStyleBuilder,
+            customLinkPrefixes: widget.customLinkPrefixes);
         result.add(Directionality(
             textDirection: getDirectionOfNode(node), child: editableTextBlock));
+
+        clearIndents = false;
       } else {
         throw StateError('Unreachable.');
       }
@@ -482,9 +829,10 @@ class RawEditorState extends EditorState
       customStyleBuilder: widget.customStyleBuilder,
       styles: _styles!,
       readOnly: widget.readOnly,
-      controller: widget.controller,
+      controller: controller,
       linkActionPicker: _linkActionPicker,
       onLaunchUrl: widget.onLaunchUrl,
+      customLinkPrefixes: widget.customLinkPrefixes,
     );
     final editableTextLine = EditableTextLine(
         node,
@@ -493,7 +841,7 @@ class RawEditorState extends EditorState
         0,
         _getVerticalSpacingForLine(node, _styles),
         _textDirection,
-        widget.controller.selection,
+        controller.selection,
         widget.selectionColor,
         widget.enableInteractiveSelection,
         _hasFocus,
@@ -502,7 +850,7 @@ class RawEditorState extends EditorState
     return editableTextLine;
   }
 
-  Tuple2<double, double> _getVerticalSpacingForLine(
+  VerticalSpacing _getVerticalSpacingForLine(
       Line line, DefaultStyles? defaultStyles) {
     final attrs = line.style.attributes;
     if (attrs.containsKey(Attribute.header.key)) {
@@ -527,7 +875,7 @@ class RawEditorState extends EditorState
     return defaultStyles!.paragraph!.verticalSpacing;
   }
 
-  Tuple2<double, double> _getVerticalSpacingForBlock(
+  VerticalSpacing _getVerticalSpacingForBlock(
       Block node, DefaultStyles? defaultStyles) {
     final attrs = node.style.attributes;
     if (attrs.containsKey(Attribute.blockQuote.key)) {
@@ -541,7 +889,7 @@ class RawEditorState extends EditorState
     } else if (attrs.containsKey(Attribute.align.key)) {
       return defaultStyles!.align!.verticalSpacing;
     }
-    return const Tuple2(0, 0);
+    return const VerticalSpacing(0, 0);
   }
 
   @override
@@ -550,8 +898,8 @@ class RawEditorState extends EditorState
 
     _clipboardStatus.addListener(_onChangedClipboardStatus);
 
-    widget.controller.addListener(() {
-      _didChangeTextEditingValue(widget.controller.ignoreFocusOnTextChange);
+    controller.addListener(() {
+      _didChangeTextEditingValue(controller.ignoreFocusOnTextChange);
     });
 
     _scrollController = widget.scrollController;
@@ -568,6 +916,9 @@ class RawEditorState extends EditorState
     _floatingCursorResetController.addListener(onFloatingCursorResetTick);
 
     if (isKeyboardOS()) {
+      _keyboardVisible = true;
+    } else if (!kIsWeb && Platform.environment.containsKey('FLUTTER_TEST')) {
+      // treat tests like a keyboard OS
       _keyboardVisible = true;
     } else {
       // treat iOS Simulator like a keyboard OS
@@ -641,9 +992,9 @@ class RawEditorState extends EditorState
     _cursorCont.show.value = widget.showCursor;
     _cursorCont.style = widget.cursorStyle;
 
-    if (widget.controller != oldWidget.controller) {
+    if (controller != oldWidget.controller) {
       oldWidget.controller.removeListener(_didChangeTextEditingValue);
-      widget.controller.addListener(_didChangeTextEditingValue);
+      controller.addListener(_didChangeTextEditingValue);
       updateRemoteValueIfNeeded();
     }
 
@@ -659,7 +1010,7 @@ class RawEditorState extends EditorState
       updateKeepAlive();
     }
 
-    if (widget.controller.selection != oldWidget.controller.selection) {
+    if (controller.selection != oldWidget.controller.selection) {
       _selectionOverlay?.update(textEditingValue);
     }
 
@@ -679,8 +1030,7 @@ class RawEditorState extends EditorState
   }
 
   bool _shouldShowSelectionHandles() {
-    return widget.showSelectionHandles &&
-        !widget.controller.selection.isCollapsed;
+    return widget.showSelectionHandles && !controller.selection.isCollapsed;
   }
 
   @override
@@ -691,7 +1041,7 @@ class RawEditorState extends EditorState
     assert(!hasConnection);
     _selectionOverlay?.dispose();
     _selectionOverlay = null;
-    widget.controller.removeListener(_didChangeTextEditingValue);
+    controller.removeListener(_didChangeTextEditingValue);
     widget.focusNode.removeListener(_handleFocusChanged);
     _cursorCont.dispose();
     _clipboardStatus
@@ -719,7 +1069,7 @@ class RawEditorState extends EditorState
       requestKeyboard();
       if (mounted) {
         setState(() {
-          // Use widget.controller.value in build()
+          // Use controller.value in build()
           // Trigger build and updateChildren
         });
       }
@@ -734,8 +1084,7 @@ class RawEditorState extends EditorState
       return;
     }
     _showCaretOnScreen();
-    _cursorCont.startOrStopCursorTimerIfNeeded(
-        _hasFocus, widget.controller.selection);
+    _cursorCont.startOrStopCursorTimerIfNeeded(_hasFocus, controller.selection);
     if (hasConnection) {
       // To keep the cursor from blinking while typing, we want to restart the
       // cursor timer every time a new character is typed.
@@ -758,7 +1107,7 @@ class RawEditorState extends EditorState
     });
     if (mounted) {
       setState(() {
-        // Use widget.controller.value in build()
+        // Use controller.value in build()
         // Trigger build and updateChildren
       });
     }
@@ -777,13 +1126,15 @@ class RawEditorState extends EditorState
         value: textEditingValue,
         context: context,
         debugRequiredFor: widget,
-        toolbarLayerLink: _toolbarLayerLink,
         startHandleLayerLink: _startHandleLayerLink,
         endHandleLayerLink: _endHandleLayerLink,
         renderObject: renderEditor,
         selectionCtrls: widget.selectionCtrls,
         selectionDelegate: this,
         clipboardStatus: _clipboardStatus,
+        contextMenuBuilder: widget.contextMenuBuilder == null
+            ? null
+            : (context) => widget.contextMenuBuilder!(context, this),
       );
       _selectionOverlay!.handlesVisible = _shouldShowSelectionHandles();
       _selectionOverlay!.showHandles();
@@ -792,8 +1143,7 @@ class RawEditorState extends EditorState
 
   void _handleFocusChanged() {
     openOrCloseConnection();
-    _cursorCont.startOrStopCursorTimerIfNeeded(
-        _hasFocus, widget.controller.selection);
+    _cursorCont.startOrStopCursorTimerIfNeeded(_hasFocus, controller.selection);
     _updateOrDisposeSelectionOverlayIfNeeded();
     if (_hasFocus) {
       WidgetsBinding.instance.addObserver(this);
@@ -882,9 +1232,19 @@ class RawEditorState extends EditorState
   /// keyboard become visible.
   @override
   void requestKeyboard() {
+    if (controller.skipRequestKeyboard) {
+      controller.skipRequestKeyboard = false;
+      return;
+    }
     if (_hasFocus) {
+      final keyboardAlreadyShown = _keyboardVisible;
       openConnectionIfNeeded();
-      _showCaretOnScreen();
+      if (!keyboardAlreadyShown) {
+        /// delay 500 milliseconds for waiting keyboard show up
+        Future.delayed(const Duration(milliseconds: 500), _showCaretOnScreen);
+      } else {
+        _showCaretOnScreen();
+      }
     } else {
       widget.focusNode.requestFocus();
     }
@@ -931,9 +1291,9 @@ class RawEditorState extends EditorState
   /// Copy current selection to [Clipboard].
   @override
   void copySelection(SelectionChangedCause cause) {
-    widget.controller.copiedImageUrl = null;
-    _pastePlainText = widget.controller.getPlainText();
-    _pasteStyle = widget.controller.getAllIndividualSelectionStyles();
+    controller.copiedImageUrl = null;
+    _pastePlainText = controller.getPlainText();
+    _pasteStyle = controller.getAllIndividualSelectionStyles();
 
     final selection = textEditingValue.selection;
     final text = textEditingValue.text;
@@ -960,9 +1320,9 @@ class RawEditorState extends EditorState
   /// Cut current selection to [Clipboard].
   @override
   void cutSelection(SelectionChangedCause cause) {
-    widget.controller.copiedImageUrl = null;
-    _pastePlainText = widget.controller.getPlainText();
-    _pasteStyle = widget.controller.getAllIndividualSelectionStyles();
+    controller.copiedImageUrl = null;
+    _pastePlainText = controller.getPlainText();
+    _pasteStyle = controller.getAllIndividualSelectionStyles();
 
     if (widget.readOnly) {
       return;
@@ -988,19 +1348,16 @@ class RawEditorState extends EditorState
       return;
     }
 
-    if (widget.controller.copiedImageUrl != null) {
+    if (controller.copiedImageUrl != null) {
       final index = textEditingValue.selection.baseOffset;
       final length = textEditingValue.selection.extentOffset - index;
-      final copied = widget.controller.copiedImageUrl!;
-      widget.controller
-          .replaceText(index, length, BlockEmbed.image(copied.item1), null);
-      if (copied.item2.isNotEmpty) {
-        widget.controller.formatText(
-            getImageNode(widget.controller, index + 1).item1,
-            1,
-            StyleAttribute(copied.item2));
+      final copied = controller.copiedImageUrl!;
+      controller.replaceText(index, length, BlockEmbed.image(copied.url), null);
+      if (copied.styleString.isNotEmpty) {
+        controller.formatText(getEmbedNode(controller, index + 1).offset, 1,
+            StyleAttribute(copied.styleString));
       }
-      widget.controller.copiedImageUrl = null;
+      controller.copiedImageUrl = null;
       await Clipboard.setData(const ClipboardData(text: ''));
       return;
     }
@@ -1011,25 +1368,45 @@ class RawEditorState extends EditorState
     }
     // Snapshot the input before using `await`.
     // See https://github.com/flutter/flutter/issues/11427
-    final data = await Clipboard.getData(Clipboard.kTextPlain);
-    if (data == null) {
+    final text = await Clipboard.getData(Clipboard.kTextPlain);
+    if (text != null) {
+      _replaceText(
+          ReplaceTextIntent(textEditingValue, text.text!, selection, cause));
+
+      bringIntoView(textEditingValue.selection.extent);
+
+      // Collapse the selection and hide the toolbar and handles.
+      userUpdateTextEditingValue(
+        TextEditingValue(
+          text: textEditingValue.text,
+          selection:
+              TextSelection.collapsed(offset: textEditingValue.selection.end),
+        ),
+        cause,
+      );
+
       return;
     }
 
-    _replaceText(
-        ReplaceTextIntent(textEditingValue, data.text!, selection, cause));
+    if (widget.onImagePaste != null) {
+      final image = await Pasteboard.image;
 
-    bringIntoView(textEditingValue.selection.extent);
+      if (image == null) {
+        return;
+      }
 
-    // Collapse the selection and hide the toolbar and handles.
-    userUpdateTextEditingValue(
-      TextEditingValue(
-        text: textEditingValue.text,
-        selection:
-            TextSelection.collapsed(offset: textEditingValue.selection.end),
-      ),
-      cause,
-    );
+      final imageUrl = await widget.onImagePaste!(image);
+      if (imageUrl == null) {
+        return;
+      }
+
+      controller.replaceText(
+        textEditingValue.selection.end,
+        0,
+        BlockEmbed.image(imageUrl),
+        null,
+      );
+    }
   }
 
   /// Select the entire text value.
@@ -1131,6 +1508,17 @@ class RawEditorState extends EditorState
       _UpdateTextSelectionToAdjacentLineAction<
           ExtendSelectionVerticallyToAdjacentLineIntent>(this);
 
+  late final _ToggleTextStyleAction _formatSelectionAction =
+      _ToggleTextStyleAction(this);
+
+  late final _IndentSelectionAction _indentSelectionAction =
+      _IndentSelectionAction(this);
+
+  late final _OpenSearchAction _openSearchAction = _OpenSearchAction(this);
+  late final _ApplyHeaderAction _applyHeaderAction = _ApplyHeaderAction(this);
+  late final _ApplyCheckListAction _applyCheckListAction =
+      _ApplyCheckListAction(this);
+
   late final Map<Type, Action<Intent>> _actions = <Type, Action<Intent>>{
     DoNothingAndStopPropagationTextIntent: DoNothingAction(consumesKey: false),
     ReplaceTextIntent: _replaceTextAction,
@@ -1172,6 +1560,18 @@ class RawEditorState extends EditorState
     CopySelectionTextIntent: _makeOverridable(_CopySelectionAction(this)),
     PasteTextIntent: _makeOverridable(CallbackAction<PasteTextIntent>(
         onInvoke: (intent) => pasteText(intent.cause))),
+
+    HideSelectionToolbarIntent:
+        _makeOverridable(_HideSelectionToolbarAction(this)),
+    UndoTextIntent: _makeOverridable(_UndoKeyboardAction(this)),
+    RedoTextIntent: _makeOverridable(_RedoKeyboardAction(this)),
+
+    OpenSearchIntent: _openSearchAction,
+    // Selection Formatting
+    ToggleTextStyleIntent: _formatSelectionAction,
+    IndentSelectionIntent: _indentSelectionAction,
+    ApplyHeaderIntent: _applyHeaderAction,
+    ApplyCheckListIntent: _applyCheckListAction,
   };
 
   @override
@@ -1184,6 +1584,24 @@ class RawEditorState extends EditorState
   void removeTextPlaceholder() {
     // this is needed for Scribble (Stylus input) in Apple platforms
     // and this package does not implement this feature
+  }
+
+  @override
+  void didChangeInputControl(
+      TextInputControl? oldControl, TextInputControl? newControl) {
+    // TODO: implement didChangeInputControl
+  }
+
+  @override
+  void performSelector(String selectorName) {
+    final intent = intentForMacOSSelector(selectorName);
+
+    if (intent != null) {
+      final primaryContext = primaryFocus?.context;
+      if (primaryContext != null) {
+        Actions.invoke(primaryContext, intent);
+      }
+    }
   }
 }
 
@@ -1449,6 +1867,7 @@ class _DocumentBoundary extends _TextBoundary {
   @override
   TextPosition getLeadingTextBoundaryAt(TextPosition position) =>
       const TextPosition(offset: 0);
+
   @override
   TextPosition getTrailingTextBoundaryAt(TextPosition position) {
     return TextPosition(
@@ -1775,7 +2194,7 @@ class _UpdateTextSelectionToAdjacentLineAction<
       return;
     }
     _runSelection = state.textEditingValue.selection;
-    final currentSelection = state.widget.controller.selection;
+    final currentSelection = state.controller.selection;
     final continueCurrentRun = currentSelection.isValid &&
         currentSelection.isCollapsed &&
         currentSelection.baseOffset == runSelection.baseOffset &&
@@ -1867,4 +2286,225 @@ class _CopySelectionAction extends ContextAction<CopySelectionTextIntent> {
   bool get isActionEnabled =>
       state.textEditingValue.selection.isValid &&
       !state.textEditingValue.selection.isCollapsed;
+}
+
+//Intent class for "escape" key to dismiss selection toolbar in Windows platform
+class HideSelectionToolbarIntent extends Intent {
+  const HideSelectionToolbarIntent();
+}
+
+class _HideSelectionToolbarAction
+    extends ContextAction<HideSelectionToolbarIntent> {
+  _HideSelectionToolbarAction(this.state);
+
+  final RawEditorState state;
+
+  @override
+  void invoke(HideSelectionToolbarIntent intent, [BuildContext? context]) {
+    state.hideToolbar();
+  }
+
+  @override
+  bool get isActionEnabled => state.textEditingValue.selection.isValid;
+}
+
+class _UndoKeyboardAction extends ContextAction<UndoTextIntent> {
+  _UndoKeyboardAction(this.state);
+
+  final RawEditorState state;
+
+  @override
+  void invoke(UndoTextIntent intent, [BuildContext? context]) {
+    if (state.controller.hasUndo) {
+      state.controller.undo();
+    }
+  }
+
+  @override
+  bool get isActionEnabled => true;
+}
+
+class _RedoKeyboardAction extends ContextAction<RedoTextIntent> {
+  _RedoKeyboardAction(this.state);
+
+  final RawEditorState state;
+
+  @override
+  void invoke(RedoTextIntent intent, [BuildContext? context]) {
+    if (state.controller.hasRedo) {
+      state.controller.redo();
+    }
+  }
+
+  @override
+  bool get isActionEnabled => true;
+}
+
+class ToggleTextStyleIntent extends Intent {
+  const ToggleTextStyleIntent(this.attribute);
+
+  final Attribute attribute;
+}
+
+// Toggles a text style (underline, bold, italic, strikethrough) on, or off.
+class _ToggleTextStyleAction extends Action<ToggleTextStyleIntent> {
+  _ToggleTextStyleAction(this.state);
+
+  final RawEditorState state;
+
+  bool _isStyleActive(Attribute styleAttr, Map<String, Attribute> attrs) {
+    if (styleAttr.key == Attribute.list.key) {
+      final attribute = attrs[styleAttr.key];
+      if (attribute == null) {
+        return false;
+      }
+      return attribute.value == styleAttr.value;
+    }
+    return attrs.containsKey(styleAttr.key);
+  }
+
+  @override
+  void invoke(ToggleTextStyleIntent intent, [BuildContext? context]) {
+    final isActive = _isStyleActive(
+        intent.attribute, state.controller.getSelectionStyle().attributes);
+    state.controller.formatSelection(
+        isActive ? Attribute.clone(intent.attribute, null) : intent.attribute);
+  }
+
+  @override
+  bool get isActionEnabled => true;
+}
+
+class IndentSelectionIntent extends Intent {
+  const IndentSelectionIntent(this.isIncrease);
+
+  final bool isIncrease;
+}
+
+// Toggles a text style (underline, bold, italic, strikethrough) on, or off.
+class _IndentSelectionAction extends Action<IndentSelectionIntent> {
+  _IndentSelectionAction(this.state);
+
+  final RawEditorState state;
+
+  @override
+  void invoke(IndentSelectionIntent intent, [BuildContext? context]) {
+    state.controller.indentSelection(intent.isIncrease);
+  }
+
+  @override
+  bool get isActionEnabled => true;
+}
+
+class OpenSearchIntent extends Intent {
+  const OpenSearchIntent();
+}
+
+// Toggles a text style (underline, bold, italic, strikethrough) on, or off.
+class _OpenSearchAction extends ContextAction<OpenSearchIntent> {
+  _OpenSearchAction(this.state);
+
+  final RawEditorState state;
+
+  @override
+  Future invoke(OpenSearchIntent intent, [BuildContext? context]) async {
+    await showDialog<String>(
+      context: context!,
+      builder: (_) => SearchDialog(controller: state.controller, text: ''),
+    );
+  }
+
+  @override
+  bool get isActionEnabled => true;
+}
+
+class ApplyHeaderIntent extends Intent {
+  const ApplyHeaderIntent(this.header);
+
+  final Attribute header;
+}
+
+// Toggles a text style (underline, bold, italic, strikethrough) on, or off.
+class _ApplyHeaderAction extends Action<ApplyHeaderIntent> {
+  _ApplyHeaderAction(this.state);
+
+  final RawEditorState state;
+
+  Attribute<dynamic> _getHeaderValue() {
+    return state.controller
+            .getSelectionStyle()
+            .attributes[Attribute.header.key] ??
+        Attribute.header;
+  }
+
+  @override
+  void invoke(ApplyHeaderIntent intent, [BuildContext? context]) {
+    final _attribute =
+        _getHeaderValue() == intent.header ? Attribute.header : intent.header;
+    state.controller.formatSelection(_attribute);
+  }
+
+  @override
+  bool get isActionEnabled => true;
+}
+
+class ApplyCheckListIntent extends Intent {
+  const ApplyCheckListIntent();
+}
+
+// Toggles a text style (underline, bold, italic, strikethrough) on, or off.
+class _ApplyCheckListAction extends Action<ApplyCheckListIntent> {
+  _ApplyCheckListAction(this.state);
+
+  final RawEditorState state;
+
+  bool _getIsToggled() {
+    final attrs = state.controller.getSelectionStyle().attributes;
+    var attribute = state.controller.toolbarButtonToggler[Attribute.list.key];
+
+    if (attribute == null) {
+      attribute = attrs[Attribute.list.key];
+    } else {
+      // checkbox tapping causes controller.selection to go to offset 0
+      state.controller.toolbarButtonToggler.remove(Attribute.list.key);
+    }
+
+    if (attribute == null) {
+      return false;
+    }
+    return attribute.value == Attribute.unchecked.value ||
+        attribute.value == Attribute.checked.value;
+  }
+
+  @override
+  void invoke(ApplyCheckListIntent intent, [BuildContext? context]) {
+    state.controller.formatSelection(_getIsToggled()
+        ? Attribute.clone(Attribute.unchecked, null)
+        : Attribute.unchecked);
+  }
+
+  @override
+  bool get isActionEnabled => true;
+}
+
+/// Signature for a widget builder that builds a context menu for the given
+/// [RawEditorState].
+///
+/// See also:
+///
+///  * [EditableTextContextMenuBuilder], which performs the same role for
+///    [EditableText]
+typedef QuillEditorContextMenuBuilder = Widget Function(
+  BuildContext context,
+  RawEditorState rawEditorState,
+);
+
+class _GlyphHeights {
+  _GlyphHeights(
+    this.startGlyphHeight,
+    this.endGlyphHeight,
+  );
+
+  final double startGlyphHeight;
+  final double endGlyphHeight;
 }

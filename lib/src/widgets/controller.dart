@@ -2,7 +2,6 @@ import 'dart:math' as math;
 
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/services.dart';
-import 'package:tuple/tuple.dart';
 
 import '../models/documents/attribute.dart';
 import '../models/documents/document.dart';
@@ -10,6 +9,9 @@ import '../models/documents/nodes/embeddable.dart';
 import '../models/documents/nodes/leaf.dart';
 import '../models/documents/style.dart';
 import '../models/quill_delta.dart';
+import '../models/structs/doc_change.dart';
+import '../models/structs/image_url.dart';
+import '../models/structs/offset_value.dart';
 import '../utils/delta.dart';
 
 typedef ReplaceTextCallback = bool Function(int index, int len, Object? data);
@@ -17,14 +19,15 @@ typedef DeleteCallback = void Function(int cursorPosition, bool forward);
 
 class QuillController extends ChangeNotifier {
   QuillController({
-    required this.document,
+    required Document document,
     required TextSelection selection,
     bool keepStyleOnNewLine = false,
     this.onReplaceText,
     this.onDelete,
     this.onSelectionCompleted,
     this.onSelectionChanged,
-  })  : _selection = selection,
+  })  : _document = document,
+        _selection = selection,
         _keepStyleOnNewLine = keepStyleOnNewLine;
 
   factory QuillController.basic() {
@@ -35,7 +38,16 @@ class QuillController extends ChangeNotifier {
   }
 
   /// Document managed by this controller.
-  final Document document;
+  Document _document;
+  Document get document => _document;
+  set document(doc) {
+    _document = doc;
+
+    // Prevent the selection from
+    _selection = const TextSelection(baseOffset: 0, extentOffset: 0);
+
+    notifyListeners();
+  }
 
   /// Tells whether to keep or reset the [toggledStyle]
   /// when user adds a new line.
@@ -62,18 +74,17 @@ class QuillController extends ChangeNotifier {
 
   bool ignoreFocusOnTextChange = false;
 
+  /// Skip requestKeyboard being called in
+  /// RawEditorState#_didChangeTextEditingValue
+  bool skipRequestKeyboard = false;
+
   /// True when this [QuillController] instance has been disposed.
   ///
   /// A safety mechanism to ensure that listeners don't crash when adding,
   /// removing or listeners to this instance.
   bool _isDisposed = false;
 
-  // item1: Document state before [change].
-  //
-  // item2: Change delta applied to the document.
-  //
-  // item3: The source of this change.
-  Stream<Tuple3<Delta, Delta, ChangeSource>> get changes => document.changes;
+  Stream<DocChange> get changes => document.changes;
 
   TextEditingValue get plainTextEditingValue => TextEditingValue(
         text: document.toPlainText(),
@@ -88,8 +99,28 @@ class QuillController extends ChangeNotifier {
         .mergeAll(toggledStyle);
   }
 
+  // Increases or decreases the indent of the current selection by 1.
+  void indentSelection(bool isIncrease) {
+    final indent = getSelectionStyle().attributes[Attribute.indent.key];
+    if (indent == null) {
+      if (isIncrease) {
+        formatSelection(Attribute.indentL1);
+      }
+      return;
+    }
+    if (indent.value == 1 && !isIncrease) {
+      formatSelection(Attribute.clone(Attribute.indentL1, null));
+      return;
+    }
+    if (isIncrease) {
+      formatSelection(Attribute.getIndentLevel(indent.value + 1));
+      return;
+    }
+    formatSelection(Attribute.getIndentLevel(indent.value - 1));
+  }
+
   /// Returns all styles for each node within selection
-  List<Tuple2<int, Style>> getAllIndividualSelectionStyles() {
+  List<OffsetValue<Style>> getAllIndividualSelectionStyles() {
     final styles = document.collectAllIndividualStyles(
         selection.start, selection.end - selection.start);
     return styles;
@@ -111,9 +142,9 @@ class QuillController extends ChangeNotifier {
   }
 
   void undo() {
-    final tup = document.undo();
-    if (tup.item1) {
-      _handleHistoryChange(tup.item2);
+    final result = document.undo();
+    if (result.changed) {
+      _handleHistoryChange(result.len);
     }
   }
 
@@ -133,9 +164,9 @@ class QuillController extends ChangeNotifier {
   }
 
   void redo() {
-    final tup = document.redo();
-    if (tup.item1) {
-      _handleHistoryChange(tup.item2);
+    final result = document.redo();
+    if (result.changed) {
+      _handleHistoryChange(result.len);
     }
   }
 
@@ -335,16 +366,15 @@ class QuillController extends ChangeNotifier {
 
   /// Given offset, find its leaf node in document
   Leaf? queryNode(int offset) {
-    return document.querySegmentLeafNode(offset).item2;
+    return document.querySegmentLeafNode(offset).leaf;
   }
 
   /// Clipboard for image url and its corresponding style
-  /// item1 is url and item2 is style string
-  Tuple2<String, String>? _copiedImageUrl;
+  ImageUrl? _copiedImageUrl;
 
-  Tuple2<String, String>? get copiedImageUrl => _copiedImageUrl;
+  ImageUrl? get copiedImageUrl => _copiedImageUrl;
 
-  set copiedImageUrl(Tuple2<String, String>? value) {
+  set copiedImageUrl(ImageUrl? value) {
     _copiedImageUrl = value;
     Clipboard.setData(const ClipboardData(text: ''));
   }

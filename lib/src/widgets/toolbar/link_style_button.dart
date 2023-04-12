@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:tuple/tuple.dart';
 
 import '../../models/documents/attribute.dart';
 import '../../models/rules/insert.dart';
@@ -17,6 +16,7 @@ class LinkStyleButton extends StatefulWidget {
     this.icon,
     this.iconTheme,
     this.dialogTheme,
+    this.afterButtonPressed,
     Key? key,
   }) : super(key: key);
 
@@ -25,6 +25,7 @@ class LinkStyleButton extends StatefulWidget {
   final double iconSize;
   final QuillIconTheme? iconTheme;
   final QuillDialogTheme? dialogTheme;
+  final VoidCallback? afterButtonPressed;
 
   @override
   _LinkStyleButtonState createState() => _LinkStyleButtonState();
@@ -56,54 +57,35 @@ class _LinkStyleButtonState extends State<LinkStyleButton> {
     widget.controller.removeListener(_didChangeSelection);
   }
 
-  final GlobalKey _toolTipKey = GlobalKey();
-
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final isToggled = _getLinkAttributeValue() != null;
     final pressedHandler = () => _openLinkDialog(context);
-    return GestureDetector(
-      onTap: () async {
-        final dynamic tooltip = _toolTipKey.currentState;
-        tooltip.ensureTooltipVisible();
-        Future.delayed(
-          const Duration(
-            seconds: 3,
-          ),
-          tooltip.deactivate,
-        );
-      },
-      child: Tooltip(
-        key: _toolTipKey,
-        message: 'Please first select some text to transform into a link.'.i18n,
-        child: QuillIconButton(
-          highlightElevation: 0,
-          hoverElevation: 0,
-          size: widget.iconSize * kIconButtonFactor,
-          icon: Icon(
-            widget.icon ?? Icons.link,
-            size: widget.iconSize,
-            color: isToggled
-                ? (widget.iconTheme?.iconSelectedColor ??
-                    theme.primaryIconTheme.color)
-                : (widget.iconTheme?.iconUnselectedColor ??
-                    theme.iconTheme.color),
-          ),
-          fillColor: isToggled
-              ? (widget.iconTheme?.iconSelectedFillColor ??
-                  theme.toggleableActiveColor)
-              : (widget.iconTheme?.iconUnselectedFillColor ??
-                  theme.canvasColor),
-          borderRadius: widget.iconTheme?.borderRadius ?? 2,
-          onPressed: pressedHandler,
-        ),
+    return QuillIconButton(
+      highlightElevation: 0,
+      hoverElevation: 0,
+      size: widget.iconSize * kIconButtonFactor,
+      icon: Icon(
+        widget.icon ?? Icons.link,
+        size: widget.iconSize,
+        color: isToggled
+            ? (widget.iconTheme?.iconSelectedColor ??
+                theme.primaryIconTheme.color)
+            : (widget.iconTheme?.iconUnselectedColor ?? theme.iconTheme.color),
       ),
+      fillColor: isToggled
+          ? (widget.iconTheme?.iconSelectedFillColor ??
+              Theme.of(context).primaryColor)
+          : (widget.iconTheme?.iconUnselectedFillColor ?? theme.canvasColor),
+      borderRadius: widget.iconTheme?.borderRadius ?? 2,
+      onPressed: pressedHandler,
+      afterPressed: widget.afterButtonPressed,
     );
   }
 
   void _openLinkDialog(BuildContext context) {
-    showDialog<dynamic>(
+    showDialog<_TextLink>(
       context: context,
       builder: (ctx) {
         final link = _getLinkAttributeValue();
@@ -113,7 +95,7 @@ class _LinkStyleButtonState extends State<LinkStyleButton> {
         if (link != null) {
           // text should be the link's corresponding text, not selection
           final leaf =
-              widget.controller.document.querySegmentLeafNode(index).item2;
+              widget.controller.document.querySegmentLeafNode(index).leaf;
           if (leaf != null) {
             text = leaf.toPlainText();
           }
@@ -139,24 +121,21 @@ class _LinkStyleButtonState extends State<LinkStyleButton> {
         ?.value;
   }
 
-  void _linkSubmitted(dynamic value) {
-    // text.isNotEmpty && link.isNotEmpty
-    final String text = (value as Tuple2).item1;
-    final String link = value.item2.trim();
-
+  void _linkSubmitted(_TextLink value) {
     var index = widget.controller.selection.start;
     var length = widget.controller.selection.end - index;
     if (_getLinkAttributeValue() != null) {
       // text should be the link's corresponding text, not selection
-      final leaf = widget.controller.document.querySegmentLeafNode(index).item2;
+      final leaf = widget.controller.document.querySegmentLeafNode(index).leaf;
       if (leaf != null) {
         final range = getLinkRange(leaf);
         index = range.start;
         length = range.end - range.start;
       }
     }
-    widget.controller.replaceText(index, length, text, null);
-    widget.controller.formatText(index, text.length, LinkAttribute(link));
+    widget.controller.replaceText(index, length, value.text, null);
+    widget.controller
+        .formatText(index, value.text.length, LinkAttribute(value.link));
   }
 }
 
@@ -257,6 +236,16 @@ class _LinkDialogState extends State<_LinkDialog> {
   }
 
   void _applyLink() {
-    Navigator.pop(context, Tuple2(_text.trim(), _link.trim()));
+    Navigator.pop(context, _TextLink(_text.trim(), _link.trim()));
   }
+}
+
+class _TextLink {
+  _TextLink(
+    this.text,
+    this.link,
+  );
+
+  final String text;
+  final String link;
 }
