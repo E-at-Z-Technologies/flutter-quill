@@ -6,13 +6,11 @@ import 'package:flutter_quill/flutter_quill.dart';
 import 'embeds/builders.dart';
 import 'embeds/embed_types.dart';
 import 'embeds/toolbar/camera_button.dart';
-import 'embeds/toolbar/formula_button.dart';
 import 'embeds/toolbar/image_button.dart';
 import 'embeds/toolbar/video_button.dart';
 
 export 'embeds/embed_types.dart';
 export 'embeds/toolbar/camera_button.dart';
-export 'embeds/toolbar/formula_button.dart';
 export 'embeds/toolbar/image_button.dart';
 export 'embeds/toolbar/image_video_utils.dart';
 export 'embeds/toolbar/media_button.dart';
@@ -26,7 +24,6 @@ class FlutterQuillEmbeds {
       [
         ImageEmbedBuilder(),
         VideoEmbedBuilder(onVideoInit: onVideoInit),
-        FormulaEmbedBuilder(),
       ];
 
   static List<EmbedBuilder> webBuilders() => [
@@ -37,11 +34,9 @@ class FlutterQuillEmbeds {
     bool showImageButton = true,
     bool showVideoButton = true,
     bool showCameraButton = true,
-    bool showFormulaButton = false,
     String? imageButtonTooltip,
     String? videoButtonTooltip,
     String? cameraButtonTooltip,
-    String? formulaButtonTooltip,
     OnImagePickCallback? onImagePickCallback,
     OnVideoPickCallback? onVideoPickCallback,
     MediaPickSettingSelector? mediaPickSettingSelector,
@@ -92,15 +87,5 @@ class FlutterQuillEmbeds {
                 cameraPickSettingSelector: cameraPickSettingSelector,
                 iconTheme: iconTheme,
               ),
-        if (showFormulaButton)
-          (controller, toolbarIconSize, iconTheme, dialogTheme) =>
-              FormulaButton(
-                icon: Icons.functions,
-                iconSize: toolbarIconSize,
-                tooltip: formulaButtonTooltip,
-                controller: controller,
-                iconTheme: iconTheme,
-                dialogTheme: dialogTheme,
-              )
       ];
 }
